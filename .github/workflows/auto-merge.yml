@@ -1,87 +1,78 @@
-name: auto-merge
+name: Vision Roadmap Auto-Merge
 
 on:
-  workflow_call:
-    inputs:
-      auto-approve:
-        description: Approve eligible pull requests (no breaking changes, no maintainer changes)
-        default: true
-        required: false
-        type: boolean
-      auto-merge:
-        description: Merge eligible pull requests (when all required checks pass)
-        default: false
-        required: false
-        type: boolean
-      target-repo:
-        description: |
-          (Deprecated) This input is deprecated and will be removed soon. Remove it from your workflow, or it will start failing silently. To prevent fork execution, add this to your job instead: if: github.repository_owner == 'your-org'"
-        required: false
-        type: string
-    secrets:
-      GH_TOKEN:
-        description: "Personal access token passed from the caller workflow"
-        required: true
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+    branches:
+      - main
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
 
 jobs:
-  auto-merge:
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+  roadmap-automerge:
+    name: Controlled roadmap auto-merge
     runs-on: ubuntu-latest
 
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == 'main' &&
+      contains(github.event.pull_request.labels.*.name, 'vision-automerge') &&
+      (
+        startsWith(github.event.pull_request.head.ref, 'feat/v15') ||
+        startsWith(github.event.pull_request.head.ref, 'feat/v16') ||
+        startsWith(github.event.pull_request.head.ref, 'fix/v15') ||
+        startsWith(github.event.pull_request.head.ref, 'fix/v16')
+      )
+
     steps:
-      - name: Warn on deprecated inputs
-        if: inputs.target-repo != ''
-        run: |
-          echo "::warning::The 'target-repo' input is deprecated and will be removed soon. Remove it from your workflow, or it will start failing silently. To prevent fork execution, add this to your job instead: if: github.repository_owner == 'your-org'"
-
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout PR head
+        uses: actions/checkout@v4
         with:
-          persist-credentials: false
-          token: ${{ github.token }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
-      - name: Dependabot metadata
-        id: dependabot-metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-        with:
-          github-token: ${{ secrets.GH_TOKEN }}
+      - name: Fetch main
+        run: git fetch origin main
 
-      - name: Check for breaking change
-        id: check
-        env:
-          UPDATE_TYPE: ${{ steps.dependabot-metadata.outputs.update-type }}
-          PREV_VERSION: ${{ steps.dependabot-metadata.outputs.previous-version }}
-          MAINTAINER_CHANGES: ${{ steps.dependabot-metadata.outputs.maintainer-changes }}
+      - name: Scope guard
+        shell: bash
         run: |
-          eligible=true
+          set -euo pipefail
 
-          # Major updates are breaking
-          if [[ "$UPDATE_TYPE" == "version-update:semver-major" ]]; then
-            eligible=false
-          # For 0.x versions, minor updates are breaking (semver spec)
-          elif [[ "$PREV_VERSION" == 0.* && "$UPDATE_TYPE" == "version-update:semver-minor" ]]; then
-            eligible=false
-          # For 0.0.x versions, patch updates are breaking (semver spec)
-          elif [[ "$PREV_VERSION" == 0.0.* && "$UPDATE_TYPE" == "version-update:semver-patch" ]]; then
-            eligible=false
-          # Package maintainers changed between versions
-          elif [[ "$MAINTAINER_CHANGES" == "true" ]]; then
-            eligible=false
+          git diff --name-only origin/main...HEAD | tee /tmp/changed-files.txt
+
+          BAD_FILES="$(grep -Ev '^(package\.json|tools/|docs/|\.github/workflows/vision-roadmap-automerge\.yml)$' /tmp/changed-files.txt || true)"
+
+          if [ -n "$BAD_FILES" ]; then
+            echo "Blocked: files outside allowed roadmap scope:"
+            echo "$BAD_FILES"
+            exit 1
           fi
 
-          echo "eligible=$eligible" >> $GITHUB_OUTPUT
+      - name: Safety diff guard
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Approve
-        if: inputs.auto-approve && steps.check.outputs.eligible == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: gh pr review ${{ github.event.pull_request.html_url }} --approve
+          git diff origin/main...HEAD > /tmp/pr.diff
 
-      - name: Enable auto-merge
-        if: inputs.auto-merge && steps.check.outputs.eligible == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: gh pr merge ${{ github.event.pull_request.html_url }} --auto --squash
+          BLOCKED_PATTERNS='deploy_allowed[[:space:]]*[:=][[:space:]]*true|release_allowed[[:space:]]*[:=][[:space:]]*true|tag_allowed[[:space:]]*[:=][[:space:]]*true|stable_allowed[[:space:]]*[:=][[:space:]]*true|promotion_allowed[[:space:]]*[:=][[:space:]]*true|pass_gold_candidate[[:space:]]*[:=][[:space:]]*true|PASS_GOLD_FAKE'
+
+          if grep -E "$BLOCKED_PATTERNS" /tmp/pr.diff; then
+            echo "Blocked: forbidden release/deploy/stable/PASS GOLD pattern found."
+            exit 1
+          fi
+
+      - name: Fast validation
+        shell: bash
+        run: |
+          set -
